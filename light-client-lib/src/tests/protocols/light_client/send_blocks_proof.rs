@@ -1,7 +1,9 @@
 use ckb_network::{CKBProtocolHandler, PeerIndex, SupportProtocols};
 use ckb_types::{
-    core::BlockNumber, h256, packed, prelude::*, utilities::merkle_mountain_range::VerifiableHeader,
+    core::BlockNumber, h256, packed, prelude::*,
+    utilities::merkle_mountain_range::VerifiableHeader, H256,
 };
+use std::collections::HashMap;
 
 use crate::{
     protocols::{LastState, ProveRequest, ProveState, StatusCode},
@@ -111,6 +113,19 @@ async fn last_state_is_changed() {
             ProveState::new_from_request(prove_request.clone(), Vec::new(), last_n_headers)
         };
         let content = chain.build_blocks_proof_content(num, &block_numbers, &[]);
+        let expected_heights = block_numbers
+            .iter()
+            .map(|&n| {
+                (
+                    snapshot
+                        .get_header_by_number(n)
+                        .expect("block stored")
+                        .hash()
+                        .unpack(),
+                    n,
+                )
+            })
+            .collect::<HashMap<H256, BlockNumber>>();
         protocol
             .peers()
             .update_last_state(peer_index, last_state)
@@ -123,9 +138,12 @@ async fn last_state_is_changed() {
             .commit_prove_state(peer_index, prove_state)
             .await
             .unwrap();
-        protocol
-            .peers()
-            .update_blocks_proof_request(peer_index, Some(content), true);
+        protocol.peers().update_blocks_proof_request(
+            peer_index,
+            Some(content),
+            expected_heights,
+            true,
+        );
     }
 
     num += 1;
@@ -218,9 +236,25 @@ async fn unexpected_response() {
             .commit_prove_state(peer_index, prove_state)
             .await
             .unwrap();
-        protocol
-            .peers()
-            .update_blocks_proof_request(peer_index, Some(content), true);
+        let expected_heights = block_numbers
+            .iter()
+            .map(|&n| {
+                (
+                    snapshot
+                        .get_header_by_number(n)
+                        .expect("block stored")
+                        .hash()
+                        .unpack(),
+                    n,
+                )
+            })
+            .collect::<HashMap<H256, BlockNumber>>();
+        protocol.peers().update_blocks_proof_request(
+            peer_index,
+            Some(content),
+            expected_heights,
+            true,
+        );
     }
 
     // Run the test.
@@ -326,9 +360,25 @@ async fn get_blocks_with_chunks() {
             .commit_prove_state(peer_index, prove_state)
             .await
             .unwrap();
-        protocol
-            .peers()
-            .update_blocks_proof_request(peer_index, Some(content), true);
+        let expected_heights = block_numbers
+            .iter()
+            .map(|&n| {
+                (
+                    snapshot
+                        .get_header_by_number(n)
+                        .expect("block stored")
+                        .hash()
+                        .unpack(),
+                    n,
+                )
+            })
+            .collect::<HashMap<H256, BlockNumber>>();
+        protocol.peers().update_blocks_proof_request(
+            peer_index,
+            Some(content),
+            expected_heights,
+            true,
+        );
     }
 
     // Run the test.
@@ -709,6 +759,39 @@ struct TestParameter {
     returned_extensions: Option<Vec<packed::BytesOpt>>,
     use_legacy_message: bool,
     expected_status: Option<StatusCode>,
+    /// Heights to record as the ones `BlockFilters` matched each block at.
+    ///
+    /// Defaults to the blocks' real heights, which is the honest case. Setting a
+    /// height different from where the block actually sits models a peer that sent
+    /// correct filter data for one height and the provable hash of a block from
+    /// another — the shape of the 0058 attack.
+    matched_heights: Option<Vec<BlockNumber>>,
+}
+
+/// A peer sends correct filter data for heights 1000/1005/1008, but fills the
+/// corresponding `block_hashes[]` entries with the hashes of blocks 3/5/8 — real,
+/// provable blocks that sit at other heights.
+///
+/// The MMR proof for those blocks succeeds, because it only shows they are
+/// somewhere in the chain; it says nothing about which height they occupy. Without
+/// the height binding in `SendBlocksProofProcess` the client would download them,
+/// index them as 1000/1005/1008, and advance the cursor past those heights — so the
+/// real blocks there would never be scanned and any transaction touching a watched
+/// script would be missed. This is the shape of sec-reports `PENDING-HIGH-0058`.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_proof_of_block_at_a_different_height_than_the_filters_matched() {
+    let param = TestParameter {
+        last_block_number: 20,
+        block_numbers: vec![3, 5, 8],
+        proved_block_numbers: vec![3, 5, 8],
+        returned_headers: vec![3, 5, 8],
+        // The filters claimed these blocks sit at heights with nothing to do with
+        // where they actually are.
+        matched_heights: Some(vec![1000, 1005, 1008]),
+        expected_status: Some(StatusCode::InvalidProof),
+        ..Default::default()
+    };
+    test_send_blocks_proof(param).await;
 }
 
 async fn test_send_blocks_proof(param: TestParameter) {
@@ -775,9 +858,31 @@ async fn test_send_blocks_proof(param: TestParameter) {
             .commit_prove_state(peer_index, prove_state)
             .await
             .unwrap();
-        protocol
-            .peers()
-            .update_blocks_proof_request(peer_index, Some(content), true);
+        let claimed_heights = param
+            .matched_heights
+            .clone()
+            .unwrap_or_else(|| param.block_numbers.clone());
+        let expected_heights = param
+            .block_numbers
+            .iter()
+            .zip(claimed_heights)
+            .map(|(&real, claimed)| {
+                (
+                    snapshot
+                        .get_header_by_number(real)
+                        .expect("block stored")
+                        .hash()
+                        .unpack(),
+                    claimed,
+                )
+            })
+            .collect::<HashMap<H256, BlockNumber>>();
+        protocol.peers().update_blocks_proof_request(
+            peer_index,
+            Some(content),
+            expected_heights,
+            true,
+        );
     }
 
     // Run the test.
