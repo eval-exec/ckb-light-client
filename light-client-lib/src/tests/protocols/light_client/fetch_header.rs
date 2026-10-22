@@ -934,3 +934,46 @@ async fn dropping_inflight_options_releases_tracking_without_discarding_ordinary
         .get_blocks_proof_request()
         .is_some());
 }
+
+/// Regression test for the reader-side mutation in `header_revalidation_chain`.
+///
+/// `fetch_header_with_options` reads the accepted tip and later calls
+/// `header_revalidation_chain` with that value. The two operations are not atomic, so a
+/// verified commit can land between them. This test simulates exactly that interleaving:
+/// the request is created at tip #20, the chain extends to #21, and then a lookup is made
+/// with the stale #20 anchor.
+///
+/// A stale anchor lookup must be read-only. Otherwise it rotates the global chain
+/// identity and invalidates every revalidation created before the extension, including
+/// this request, which was legitimately anchored at #20.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_anchor_lookup_must_not_invalidate_existing_revalidation() {
+    let mut fixture = fixture();
+    let hash = fixture.hash(3);
+
+    // Capture the chain identity at tip #20.
+    let mut options = FetchHeaderOptions::new(true);
+    assert!(matches!(
+        fixture.poll(&hash, &mut options),
+        FetchStatus::Added { .. }
+    ));
+
+    // A verified extension #20 -> #21 must preserve that identity.
+    fixture.prove_tip(21).await;
+
+    // Simulate the TOCTOU: the tip was read before the extension, but the chain lookup
+    // happens after it.
+    let stale_anchor = fixture.header(20).hash();
+    let _ = fixture.peers.header_revalidation_chain(&stale_anchor);
+
+    // The operation created at #20 must still be usable.
+    let status = fixture
+        .service
+        .fetch_header_with_options(&hash, &mut options);
+    assert!(
+        status.is_ok(),
+        "a stale anchor lookup invalidated an existing revalidation: {:?}",
+        status.err()
+    );
+    assert!(matches!(status.unwrap(), FetchStatus::Added { .. }));
+}
